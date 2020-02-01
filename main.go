@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -17,10 +18,19 @@ import (
 func main() {
 	const redisBasis = "baka-dns:urls"
 
+	f, err := os.OpenFile("dns-server-log.csv", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		fmt.Println("Unable to open log file for appending\nResolve this issue then restart if logging desired")
+	} else {
+		fmt.Println("Log file opened")
+	}
+
 	pool, err := radix.NewPool("tcp", "127.0.0.1:64444", 10)
 	if err != nil {
 		fmt.Println("Redis is down! Directing all operations to remote")
 		pool = nil
+	} else {
+		fmt.Println("Redis connected")
 	}
 
 	dnsConfig := dns.ClientConfig{Servers: []string{"1.1.1.1", "1.0.0.1"}, Port: "53"}
@@ -163,6 +173,14 @@ func main() {
 			} else {
 				fmt.Println("Unable to resolve", fqdn)
 				resolveWith <- fmt.Sprintf("Unable to resolve %s", host)
+				resolved = "\"Unable to resolve\""
+			}
+
+			if f != nil {
+				if _, err := f.Write([]byte(fmt.Sprintf("%s,%s\n", host, resolved))); err != nil {
+					fmt.Println("Error while writing log, closing file")
+					f.Close()
+				}
 			}
 		}(resolveWith)
 
@@ -202,5 +220,13 @@ func main() {
 		}
 	}()
 
+	fmt.Println("Listening on :9889 (WS)\nListening on :9888 (POST)")
+
 	http.ListenAndServe(":9888", nil)
+
+	if f != nil {
+		if err := f.Close(); err != nil {
+			fmt.Println("Closed logging file")
+		}
+	}
 }
