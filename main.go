@@ -48,16 +48,18 @@ func main() {
 	knownServers := []string{"1.1.1.1", "1.0.0.1", "127.0.0.53"}
 	var operationalServers []string
 
-	for server := range knownServers {
+	for i := range knownServers {
+		server := knownServers[i]
+
 		// Setup the dns message
 		m := new(dns.Msg)
 		m.SetQuestion(dns.Fqdn("google.com"), dns.TypeA)
 		m.RecursionDesired = true
 
 		// Make the dns request
-		_, _, err := dnsClient.Exchange(m, net.JoinHostPort(string(server), "53"))
-		if err != nil {
-			operationalServers = append(operationalServers, string(server))
+		_, _, err := dnsClient.Exchange(m, net.JoinHostPort(server, "53"))
+		if err == nil {
+			operationalServers = append(operationalServers, server)
 		}
 	}
 
