@@ -4,159 +4,203 @@ import (
 	"fmt"
 	"github.com/mediocregopher/radix"
 	"github.com/miekg/dns"
-	"github.com/tatsushid/go-fastping"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"os/exec"
+	"strconv"
 	"strings"
-	"time"
+	"sync"
 )
 
 func main() {
+	const redisBasis = "baka-dns:urls"
 
 	pool, err := radix.NewPool("tcp", "127.0.0.1:64444", 10)
 	if err != nil {
-		fmt.Println("Redis is down!")
+		fmt.Println("Redis is down! Directing all operations to remote")
+		pool = nil
 	}
 
 	dnsConfig := dns.ClientConfig{Servers: []string{"1.1.1.1", "1.0.0.1"}, Port: "53"}
 	dnsClient := new(dns.Client)
 
-	h1 := func(res http.ResponseWriter, req *http.Request) {
-		data := make([]byte, req.ContentLength)
-		if _, err := io.ReadFull(req.Body, data); err != nil {
+	dnsHandler := func(data string) string {
+		requestedUrl, err := url.Parse(data)
+
+		if err != nil {
+			fmt.Println("Unable to parse requested url")
+			return "Unable to parse requested url"
+		}
+
+		host := requestedUrl.Hostname()
+		if host == "" {
+			host = strings.Trim(strings.Split(requestedUrl.EscapedPath(), "/")[0], " ")
+		}
+
+		if host == "" {
+			fmt.Println("Unable to parse requested url")
+			return "Unable to parse requested url"
+		}
+
+		host = strings.ToLower(host)
+		fqdn := host
+
+		if !strings.HasSuffix(host, ".") {
+			fqdn = host + "."
+		}
+
+		fmt.Println("Searching for", fqdn)
+		resolveWith := make(chan string)
+
+		go func(resolveWith chan string) {
+			resolved := ""
+			source := "local"
+			ttl := 300
+
+			if pool != nil {
+				err = pool.Do(radix.Cmd(&resolved, "GET", fmt.Sprintf("%s:%s", redisBasis, fqdn)))
+			}
+
+			if err != nil || resolved == "" {
+				fmt.Println(host, "not found in local, querying remote...")
+
+				m := new(dns.Msg)
+				m.SetQuestion(dns.Fqdn(fqdn), dns.TypeA)
+				m.RecursionDesired = true
+
+				dnsRes, _, err := dnsClient.Exchange(m, net.JoinHostPort(dnsConfig.Servers[0], dnsConfig.Port))
+				if err == nil && len(dnsRes.Answer) != 0 {
+					source = dnsConfig.Servers[0]
+
+					if len(dnsRes.Answer) > 1 {
+						fmt.Println("Found multiple entries for", fqdn, "Pinging...")
+						var backupResolved string
+						optimalPing := 1000.0 // 1 sec will throw an error for latency reasons
+
+						var wg sync.WaitGroup
+						var pings sync.Map
+
+						switch aRecord := dnsRes.Answer[0].(type) {
+						case *dns.A:
+							aRecordIp := aRecord.A.String()
+
+							if resolved == "" {
+								ttl = int(aRecord.Hdr.Ttl)
+								backupResolved = aRecordIp
+							}
+						}
+
+						for _, a := range dnsRes.Answer {
+							switch aRecord := a.(type) {
+							case *dns.A:
+								aRecordIp := aRecord.A.String()
+
+								wg.Add(1)
+								go func(wg *sync.WaitGroup, pings *sync.Map) {
+									defer wg.Done()
+									out, err := exec.Command("ping", "-c", "1", "-w", "1", fmt.Sprintf("%s", aRecordIp)).Output()
+									if err == nil {
+										lines := strings.Split(fmt.Sprintf("%s", out), "\n")
+										if len(lines) > 4 {
+											ping, err := strconv.ParseFloat(strings.Split(strings.Split(lines[1], "time=")[1], " ms")[0], 64)
+											if err == nil {
+												pings.Store(aRecordIp, ping)
+											}
+										}
+									}
+								}(&wg, &pings)
+							}
+						}
+
+						wg.Wait()
+						pings.Range(func(ip interface{}, pingInterface interface{}) bool {
+							ping := pingInterface.(float64)
+							if optimalPing > ping {
+								optimalPing = ping
+								resolved = ip.(string)
+							}
+							return true
+						})
+
+						if resolved == "" {
+							resolved = backupResolved
+						}
+
+						if optimalPing < 1000 {
+							fmt.Println("Finished all pings for", fqdn)
+							fmt.Println("Winner is", resolved, "at", optimalPing)
+						} else {
+							fmt.Println("All pings failed for", fqdn)
+							fmt.Println("Returning first entry as best-hope")
+						}
+					} else {
+						fmt.Println("Found one entry for", fqdn)
+						switch aRecord := dnsRes.Answer[0].(type) {
+						case *dns.A:
+							resolved = aRecord.A.String()
+							ttl = int(aRecord.Hdr.Ttl)
+						}
+					}
+				} else {
+					fmt.Println(host, "not found in remote")
+				}
+			}
+
+			if resolved != "" {
+				if pool != nil && source != "local" {
+					err = pool.Do(radix.FlatCmd(nil, "SETEX", fmt.Sprintf("%s:%s", redisBasis, fqdn), ttl, resolved))
+					if err != nil {
+						fmt.Println("Unable to cache")
+					} else {
+						fmt.Println(host, "cached")
+					}
+				}
+
+				fmt.Println(fqdn, "found in", source, "as", resolved)
+				resolveWith <- fmt.Sprintf("%s:%s:%s", source, host, resolved)
+			} else {
+				fmt.Println("Unable to resolve", fqdn)
+				resolveWith <- fmt.Sprintf("Unable to resolve %s", host)
+			}
+		}(resolveWith)
+
+		return <-resolveWith
+	}
+
+	http.HandleFunc("/", func(writer http.ResponseWriter, request *http.Request) {
+		data := make([]byte, request.ContentLength)
+		if _, err := io.ReadFull(request.Body, data); err != nil {
 			fmt.Println("error:", err)
 		}
 
-		resolved := ""
-		source := "local"
-		pinging := false
+		io.WriteString(writer, dnsHandler(fmt.Sprintf("%s", data)))
+	})
 
-		requestedUrl, err := url.Parse(fmt.Sprintf("%s", data))
+	go func() {
+		ln, _ := net.Listen("tcp", ":9889")
 
-		if err == nil {
-			host := requestedUrl.Hostname()
-			if host == "" {
-				host = strings.Trim(strings.Split(requestedUrl.EscapedPath(), "/")[0], " ")
-			}
+		for {
+			conn, _ := ln.Accept()
 
-			if host != "" {
-				host = strings.ToLower(host)
+			go func() {
+				for {
+					data := make([]byte, 1024)
 
-				fqdn := host
+					length, err := conn.Read(data)
+					if err != nil {
+						conn.Close()
+						break
+					}
 
-				if !strings.HasSuffix(host, ".") {
-					fqdn = host + "."
-				}
-
-				fmt.Println("Searching for", fqdn)
-
-				err = pool.Do(radix.Cmd(&resolved, "GET", fmt.Sprintf("baka-dns:urls:%s", fqdn)))
-				if err != nil || resolved == "" {
-					fmt.Println(host, "not found in local, querying remote...")
-
-					m := new(dns.Msg)
-					m.SetQuestion(dns.Fqdn(fqdn), dns.TypeA)
-					m.RecursionDesired = true
-
-					dnsRes, _, err := dnsClient.Exchange(m, net.JoinHostPort(dnsConfig.Servers[0], dnsConfig.Port))
-					if err == nil && len(dnsRes.Answer) != 0 {
-						source = dnsConfig.Servers[0]
-
-						if len(dnsRes.Answer) > 1 {
-							fmt.Println("Found multiple entries for", fqdn, "Pinging...")
-							pinging = true
-							Ttl := 300
-							var backupResolved string
-
-							p := fastping.NewPinger()
-
-							p.OnRecv = func(addr *net.IPAddr, rtt time.Duration) {
-								p.Stop()
-
-								if pinging {
-									pinging = false
-
-									io.WriteString(res, fmt.Sprintf("%s:%s:%s", source, host, resolved))
-									fmt.Println("finished all pings for", fqdn)
-									fmt.Println("Winner is", addr.IP.String(), "at", rtt.String())
-
-									err = pool.Do(radix.FlatCmd(nil, "SETEX", fmt.Sprintf("baka-dns:urls:%s", fqdn), Ttl, resolved))
-									if err != nil {
-										fmt.Println("Unable to cache")
-									} else {
-										fmt.Println(host, "cached")
-									}
-								}
-							}
-
-							for _, a := range dnsRes.Answer {
-								switch aRecord := a.(type) {
-								case *dns.A:
-									Ttl = int(aRecord.Hdr.Ttl)
-									if backupResolved == "" {
-										backupResolved = aRecord.A.String()
-									}
-
-									err := p.AddIP(aRecord.A.String())
-									if err != nil {
-										fmt.Println(err)
-									}
-								}
-							}
-
-							err = p.Run()
-							if err != nil {
-								fmt.Println("Unable to ping for optimal route, please run as root or allow 'unprivileged' ping via UDP.")
-								io.WriteString(res, fmt.Sprintf("%s:%s:%s", source, host, backupResolved))
-								fmt.Println(fqdn, "found in", source, "as", backupResolved)
-
-								err = pool.Do(radix.FlatCmd(nil, "SETEX", fmt.Sprintf("baka-dns:urls:%s", fqdn), Ttl, backupResolved))
-								if err != nil {
-									fmt.Println("Unable to cache")
-								} else {
-									fmt.Println(host, "cached")
-								}
-							}
-						} else {
-							fmt.Println("Found one entry for", fqdn)
-							switch aRecord := dnsRes.Answer[0].(type) {
-							case *dns.A:
-								resolved = aRecord.A.String()
-
-								err = pool.Do(radix.FlatCmd(nil, "SETEX", fmt.Sprintf("baka-dns:urls:%s", fqdn), int(aRecord.Hdr.Ttl), resolved))
-								if err != nil {
-									fmt.Println("Unable to cache")
-								} else {
-									fmt.Println(host, "cached")
-								}
-							}
-						}
-					} else {
-						fmt.Println(host, "not found in remote")
+					if length > 0 {
+						conn.Write([]byte(dnsHandler(string(data[:length]))))
 					}
 				}
-
-				if !pinging {
-					if resolved != "" {
-						io.WriteString(res, fmt.Sprintf("%s:%s:%s", source, host, resolved))
-						fmt.Println(fqdn, "found in", source, "as", resolved)
-					} else {
-						io.WriteString(res, fmt.Sprintf("Unable to resolve %s", host))
-						fmt.Println("Unable to resolve", fqdn)
-					}
-				}
-
-				return
-			}
+			}()
 		}
+	}()
 
-		io.WriteString(res, fmt.Sprintf("Unable to parse requested url"))
-		fmt.Println("Unable to parse requested url")
-	}
-
-	http.HandleFunc("/", h1)
-
-	fmt.Println(http.ListenAndServe(":9889", nil))
+	http.ListenAndServe(":9888", nil)
 }
