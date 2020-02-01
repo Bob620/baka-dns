@@ -43,9 +43,32 @@ func main() {
 		fmt.Println("Redis connected")
 	}
 
-	// Setup authoritative dns
-	dnsConfig := dns.ClientConfig{Servers: []string{"1.1.1.1", "1.0.0.1"}, Port: "53"}
+	// Set up authoritative dns client
 	dnsClient := new(dns.Client)
+	knownServers := []string{"1.1.1.1", "1.0.0.1", "127.0.0.53"}
+	var operationalServers []string
+
+	for server := range knownServers {
+		// Setup the dns message
+		m := new(dns.Msg)
+		m.SetQuestion(dns.Fqdn("google.com"), dns.TypeA)
+		m.RecursionDesired = true
+
+		// Make the dns request
+		_, _, err := dnsClient.Exchange(m, net.JoinHostPort(string(server), "53"))
+		if err != nil {
+			operationalServers = append(operationalServers, string(server))
+		}
+	}
+
+	fmt.Printf("Found %d operatonal authorative dns servers\n", len(operationalServers))
+
+	if len(operationalServers) < 1 {
+		fmt.Println("Unable to find authoritative dns, unable to start server")
+		return
+	}
+
+	dnsConfig := dns.ClientConfig{Servers: operationalServers, Port: "53"}
 
 	dnsHandler := func(data string) string {
 		// Parse requested string
