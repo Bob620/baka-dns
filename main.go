@@ -123,8 +123,18 @@ func main() {
 				m.SetQuestion(dns.Fqdn(fqdn), dns.TypeA)
 				m.RecursionDesired = true
 
-				// Make the dns request
-				dnsRes, _, err := dnsClient.Exchange(m, net.JoinHostPort(dnsConfig.Servers[0], dnsConfig.Port))
+				var dnsRes *dns.Msg
+
+				// Make the dns request to as many working servers as we can until we get a response
+				for i := range dnsConfig.Servers {
+					dnsRes, _, err = dnsClient.Exchange(m, net.JoinHostPort(dnsConfig.Servers[i], dnsConfig.Port))
+
+					if err == nil {
+						break
+					}
+				}
+
+				// Process the response if we have it
 				if err == nil && len(dnsRes.Answer) != 0 {
 					source = dnsConfig.Servers[0]
 
