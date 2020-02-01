@@ -10,3 +10,5 @@ pids
 
 *.rdb
 redis-server
+client.py
+main
