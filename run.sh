@@ -1,6 +1,7 @@
 #!/bin/sh
 
-go || (module add soft/go)
+#module add soft/go
+rm ./redis-server
 wget http://download.redis.io/redis-stable.tar.gz
 tar -xf redis-stable.tar.gz
 rm redis-stable.tar.gz
@@ -9,4 +10,4 @@ make
 cp ./src/redis-server ../
 cd .. || exit
 rm -fr ./redis-stable
-go build main.go
+./redis-server redis.conf
