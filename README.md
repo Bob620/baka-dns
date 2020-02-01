@@ -11,15 +11,18 @@ Go may not be in the path in some systems (CSE), make sure you add it:
 
 `module add soft/go`
 
-To compile and run use:
+1) Install modules:
+`go get`
+
+2a) To compile and run use:
 
 `go run main.go`
 
-To just compile use:
+2b) To just compile use:
 
 `go build main.go`
 
-Run pre-compiled:
+3) Run pre-compiled:
 
 `./main`
 
