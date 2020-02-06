@@ -134,10 +134,12 @@ func main() {
 				go func(response chan<- string) {
 					redisData := ""
 					err = pool.Do(radix.Cmd(&redisData, "GET", fmt.Sprintf("%s:%s", redisBasis, fqdn)))
+					response <- redisData
+
 					if err != nil {
-						response <- ""
-					} else {
-						response <- redisData
+						pool.Close()
+						// Redis is dead, abandon ship!
+						pool = nil
 					}
 				}(redisResponse)
 			}
@@ -164,6 +166,11 @@ func main() {
 					if err == nil {
 						break
 					}
+				}
+
+				// Catch when all of the upstream resolvers fail
+				if dnsRes == nil {
+					dnsRes = &dns.Msg{}
 				}
 
 				// Process the response if we have it
