@@ -35,6 +35,7 @@ func main() {
 	}
 
 	// Try to open redis pool
+	// If we can't connect to redis we just can't cache, not a bad tradeoff
 	pool, err := radix.NewPool("tcp", "127.0.0.1:64444", 10)
 	if err != nil {
 		fmt.Println("Redis is down! Directing all operations to remote")
@@ -48,10 +49,12 @@ func main() {
 	knownServers := []string{"1.1.1.1", "1.0.0.1", "127.0.0.53"}
 	var operationalServers []string
 
+	// Check for well-known DNS resolvers to know which ones work on the current host
+	// Common issue for CSE-Lab machines is blocking UDP to 1.1.1.1
 	for i := range knownServers {
 		server := knownServers[i]
 
-		// Setup the dns message
+		// Setup the dns message for well-known "google.com"
 		m := new(dns.Msg)
 		m.SetQuestion(dns.Fqdn("google.com"), dns.TypeA)
 		m.RecursionDesired = true
@@ -59,6 +62,7 @@ func main() {
 		// Make the dns request
 		_, _, err := dnsClient.Exchange(m, net.JoinHostPort(server, "53"))
 		if err == nil {
+			// If we get a response we can assume the server is live
 			operationalServers = append(operationalServers, server)
 		}
 	}
@@ -70,6 +74,7 @@ func main() {
 		return
 	}
 
+	// Create the dns config for live use
 	dnsConfig := dns.ClientConfig{Servers: operationalServers, Port: "53"}
 
 	dnsHandler := func(data string) string {
@@ -93,6 +98,7 @@ func main() {
 		}
 
 		// Normalize the hostname and make it a fqdn
+		// Keep the original hostname for logging
 		host = strings.ToLower(host)
 		fqdn := host
 
@@ -106,8 +112,8 @@ func main() {
 		// Spawn a goroutine to handle async tasks
 		go func(resolveWith chan string) {
 			resolved := ""
-			source := "local"
-			ttl := 300
+			source := "local" // Default to local source
+			ttl := 300        // Default to common 5min ttl unless overridden later
 
 			// Check for redis and then query the cache
 			if pool != nil {
@@ -125,7 +131,7 @@ func main() {
 
 				var dnsRes *dns.Msg
 
-				// Make the dns request to as many working servers as we can until we get a response
+				// Make the dns request to as many working servers as we need until we get a non-err response
 				for i := range dnsConfig.Servers {
 					dnsRes, _, err = dnsClient.Exchange(m, net.JoinHostPort(dnsConfig.Servers[i], dnsConfig.Port))
 
@@ -135,14 +141,17 @@ func main() {
 				}
 
 				// Process the response if we have it
+				// If not reject the request
 				if err == nil && len(dnsRes.Answer) != 0 {
 					source = dnsConfig.Servers[0]
 
+					// Check for how many answers we have to check
 					if len(dnsRes.Answer) > 1 {
 						fmt.Println("Found multiple entries for", fqdn, "Pinging...")
 						var backupResolved string
 						optimalPing := 1000.0 // 1 sec will throw an error for latency reasons
 
+						// Create a goroutine wait group and thread-safe map for pings
 						var wg sync.WaitGroup
 						var pings sync.Map
 
@@ -157,6 +166,7 @@ func main() {
 							}
 						}
 
+						// Iterate through each answer and ping the host to check for best live server
 						for _, a := range dnsRes.Answer {
 							switch aRecord := a.(type) {
 							case *dns.A:
@@ -166,11 +176,14 @@ func main() {
 								wg.Add(1)
 								go func(wg *sync.WaitGroup, pings *sync.Map) {
 									defer wg.Done()
+									// Ping command requires `root` in order to run, thus we have to `exec ping`
+									// Run ping with a timeout of 1 sec, any longer and we don't care and need to resolve
 									out, err := exec.Command("ping", "-c", "1", "-w", "1", fmt.Sprintf("%s", aRecordIp)).Output()
 									if err == nil {
 										// Process returned stdout
 										lines := strings.Split(fmt.Sprintf("%s", out), "\n")
 										if len(lines) > 4 {
+											// Parse stdout
 											ping, err := strconv.ParseFloat(strings.Split(strings.Split(lines[1], "time=")[1], " ms")[0], 64)
 											if err == nil {
 												// Store ip -> ping map
@@ -221,9 +234,14 @@ func main() {
 				}
 			}
 
+			// Resolve the request before we try to contact redis (redis is slower than acceptable)
+			fmt.Println(fqdn, "found in", source, "as", resolved)
+			resolveWith <- fmt.Sprintf("%s:%s:%s", source, host, resolved)
+
 			// If we got a non-local resolve, cache it until ttl
 			if resolved != "" {
 				if pool != nil && source != "local" {
+					// Set the dns answer with the ttl as it's expiration
 					err = pool.Do(radix.FlatCmd(nil, "SETEX", fmt.Sprintf("%s:%s", redisBasis, fqdn), ttl, resolved))
 					if err != nil {
 						fmt.Println("Unable to cache")
@@ -231,9 +249,6 @@ func main() {
 						fmt.Println(host, "cached")
 					}
 				}
-
-				fmt.Println(fqdn, "found in", source, "as", resolved)
-				resolveWith <- fmt.Sprintf("%s:%s:%s", source, host, resolved)
 			} else {
 				fmt.Println("Unable to resolve", fqdn)
 				resolveWith <- fmt.Sprintf("Unable to resolve %s", host)
@@ -279,10 +294,12 @@ func main() {
 					length, err := conn.Read(data)
 					if err != nil {
 						// Kill a dead connection or restart an existing one from an EOF error loop
+						// It should work for the provided python3 client
 						conn.Close()
 						break
 					}
 
+					// If we have a request
 					if length > 0 {
 						conn.Write([]byte(dnsHandler(string(data[:length]))))
 					}
