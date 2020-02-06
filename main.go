@@ -3,15 +3,13 @@
  *
  * This file is the entire DNS server. It runs the http servers for POST and WS connections, maintains connection pools
  * for redis, external dns, and writing to the log file. From there it spawns and runs goroutines for each connection
- * that query redis for cache, external dns for authoritative dns, and the built-in ping command on unix systems.
+ * that query redis for cache, external dns for upstream dns resolution, and the built-in ping command on unix systems.
  */
 
 package main
 
 import (
 	"fmt"
-	"github.com/mediocregopher/radix"
-	"github.com/miekg/dns"
 	"io"
 	"net"
 	"net/http"
@@ -21,6 +19,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
+
+	"github.com/mediocregopher/radix"
+	"github.com/miekg/dns"
 )
 
 func main() {
@@ -32,11 +34,19 @@ func main() {
 		fmt.Println("Unable to open log file for appending\nResolve this issue then restart if logging desired")
 	} else {
 		fmt.Println("Log file opened")
+		defer f.Close()
+	}
+
+	// Setup a custom redis client that timesout really quickly (default 1sec)
+	quickTimeoutRedis := func(network, addr string) (radix.Conn, error) {
+		return radix.Dial(network, addr,
+			radix.DialTimeout(100*time.Millisecond),
+		)
 	}
 
 	// Try to open redis pool
 	// If we can't connect to redis we just can't cache, not a bad tradeoff
-	pool, err := radix.NewPool("tcp", "127.0.0.1:64444", 10)
+	pool, err := radix.NewPool("tcp", "127.0.0.1:64444", 10, radix.PoolConnFunc(quickTimeoutRedis))
 	if err != nil {
 		fmt.Println("Redis is down! Directing all operations to remote")
 		pool = nil
@@ -44,7 +54,7 @@ func main() {
 		fmt.Println("Redis connected")
 	}
 
-	// Set up authoritative dns client
+	// Set up upstream dns client
 	dnsClient := new(dns.Client)
 	knownServers := []string{"1.1.1.1", "1.0.0.1", "127.0.0.53"}
 	var operationalServers []string
@@ -57,7 +67,6 @@ func main() {
 		// Setup the dns message for well-known "google.com"
 		m := new(dns.Msg)
 		m.SetQuestion(dns.Fqdn("google.com"), dns.TypeA)
-		m.RecursionDesired = true
 
 		// Make the dns request
 		_, _, err := dnsClient.Exchange(m, net.JoinHostPort(server, "53"))
@@ -70,12 +79,13 @@ func main() {
 	fmt.Printf("Found %d operatonal authorative dns servers\n", len(operationalServers))
 
 	if len(operationalServers) < 1 {
-		fmt.Println("Unable to find authoritative dns, unable to start server")
+		fmt.Println("Unable to find upstream dns, unable to start server")
 		return
 	}
 
 	// Create the dns config for live use
 	dnsConfig := dns.ClientConfig{Servers: operationalServers, Port: "53"}
+	dnsClient.Timeout = 100 * time.Millisecond
 
 	dnsHandler := func(data string) string {
 		// Parse requested string
@@ -115,25 +125,41 @@ func main() {
 			source := "local" // Default to local source
 			ttl := 300        // Default to common 5min ttl unless overridden later
 
+			var redisResponse chan string
+
 			// Check for redis and then query the cache
 			if pool != nil {
-				err = pool.Do(radix.Cmd(&resolved, "GET", fmt.Sprintf("%s:%s", redisBasis, fqdn)))
+				redisResponse = make(chan string)
+
+				go func(response chan<- string) {
+					redisData := ""
+					err = pool.Do(radix.Cmd(&redisData, "GET", fmt.Sprintf("%s:%s", redisBasis, fqdn)))
+					if err != nil {
+						response <- ""
+					} else {
+						response <- redisData
+					}
+				}(redisResponse)
 			}
 
-			// If we can't resolve via cache look in authoritative
-			if err != nil || resolved == "" {
+			// Setup the dns message pre-maturely while we wait for redis to resolve
+			m := new(dns.Msg)
+			m.SetQuestion(dns.Fqdn(fqdn), dns.TypeA)
+
+			if redisResponse != nil {
+				// Wait for redis to resolve
+				resolved = <-redisResponse
+			}
+
+			// If we can't resolve via cache look in upstream
+			if resolved == "" {
 				fmt.Println(host, "not found in local, querying remote...")
-
-				// Setup the dns message
-				m := new(dns.Msg)
-				m.SetQuestion(dns.Fqdn(fqdn), dns.TypeA)
-				m.RecursionDesired = true
-
 				var dnsRes *dns.Msg
 
 				// Make the dns request to as many working servers as we need until we get a non-err response
 				for i := range dnsConfig.Servers {
-					dnsRes, _, err = dnsClient.Exchange(m, net.JoinHostPort(dnsConfig.Servers[i], dnsConfig.Port))
+					source = dnsConfig.Servers[i]
+					dnsRes, _, err = dnsClient.Exchange(m, net.JoinHostPort(source, dnsConfig.Port))
 
 					if err == nil {
 						break
@@ -141,105 +167,108 @@ func main() {
 				}
 
 				// Process the response if we have it
-				// If not reject the request
-				if err == nil && len(dnsRes.Answer) != 0 {
-					source = dnsConfig.Servers[0]
+				// else reject the request
+				switch len(dnsRes.Answer) {
+				case 0:
+					// No entries found
+					fmt.Println(host, "not found in remote")
+					break
+				case 1:
+					// Only one entry was given by upstream
+					fmt.Println("Found one entry for", fqdn)
+					switch aRecord := dnsRes.Answer[0].(type) {
+					case *dns.A:
+						resolved = aRecord.A.String()
+						ttl = int(aRecord.Hdr.Ttl)
+					}
+					break
+				default:
+					// Multiple entries were given by upstream
+					fmt.Println("Found multiple entries for", fqdn, "Pinging...")
+					optimalPing := 1000.0 // 1 sec will throw an error for latency reasons
 
-					// Check for how many answers we have to check
-					if len(dnsRes.Answer) > 1 {
-						fmt.Println("Found multiple entries for", fqdn, "Pinging...")
-						var backupResolved string
-						optimalPing := 1000.0 // 1 sec will throw an error for latency reasons
+					// Create a goroutine wait group and map for pings
+					// The map should be operated over in a thread-safe manner due to only having unique ips
+					var wg sync.WaitGroup
+					var firstARecord *dns.A
+					pings := make(map[string]float64)
 
-						// Create a goroutine wait group and thread-safe map for pings
-						var wg sync.WaitGroup
-						var pings sync.Map
-
-						// Set up first ip as the best-hope backup
-						switch aRecord := dnsRes.Answer[0].(type) {
+					// Iterate through each answer and ping the host to check for best live server
+					// We should receive an A record if it didn't error because we requested one
+					for _, a := range dnsRes.Answer {
+						switch a.(type) {
 						case *dns.A:
-							aRecordIp := aRecord.A.String()
-
-							if resolved == "" {
-								ttl = int(aRecord.Hdr.Ttl)
-								backupResolved = aRecordIp
+							if firstARecord == nil {
+								firstARecord = a.(*dns.A)
 							}
-						}
 
-						// Iterate through each answer and ping the host to check for best live server
-						for _, a := range dnsRes.Answer {
-							switch aRecord := a.(type) {
-							case *dns.A:
-								aRecordIp := aRecord.A.String()
+							aRecordIp := a.(*dns.A).A.String()
 
-								// Start goroutines for each ping command
-								wg.Add(1)
-								go func(wg *sync.WaitGroup, pings *sync.Map) {
-									defer wg.Done()
-									// Ping command requires `root` in order to run, thus we have to `exec ping`
-									// Run ping with a timeout of 1 sec, any longer and we don't care and need to resolve
-									out, err := exec.Command("ping", "-c", "1", "-w", "1", fmt.Sprintf("%s", aRecordIp)).Output()
-									if err == nil {
-										// Process returned stdout
-										lines := strings.Split(fmt.Sprintf("%s", out), "\n")
-										if len(lines) > 4 {
-											// Parse stdout
-											ping, err := strconv.ParseFloat(strings.Split(strings.Split(lines[1], "time=")[1], " ms")[0], 64)
-											if err == nil {
-												// Store ip -> ping map
-												pings.Store(aRecordIp, ping)
-											}
-										}
-									}
-								}(&wg, &pings)
-							}
-						}
+							// Start goroutines for each ping command
+							wg.Add(1)
+							go func(wg *sync.WaitGroup, pings *map[string]float64) {
+								defer wg.Done()
 
-						// Wait for all pings to resolve (max 1+- sec)
-						wg.Wait()
+								// Ping command requires `root` in order to run, thus we have to `exec ping`
+								// Run ping with a timeout of 1 sec, any longer and we don't care and need to resolve
+								out, err := exec.Command("ping", "-c", "1", "-w", "1", fmt.Sprintf("%s", aRecordIp)).Output()
+								if err != nil {
+									return
+								}
 
-						// Use the optimal ping
-						pings.Range(func(ip interface{}, pingInterface interface{}) bool {
-							ping := pingInterface.(float64)
-							if optimalPing > ping {
-								optimalPing = ping
-								resolved = ip.(string)
-							}
-							return true
-						})
+								// Process returned stdout
+								lines := strings.Split(fmt.Sprintf("%s", out), "\n")
+								if len(lines) <= 4 {
+									return
+								}
 
-						// If no pings were successful use the first as the best-hope
-						if resolved == "" {
-							resolved = backupResolved
-						}
+								// Parse stdout
+								ping, err := strconv.ParseFloat(strings.Split(strings.Split(lines[1], "time=")[1], " ms")[0], 64)
+								if err != nil {
+									return
+								}
 
-						if optimalPing < 1000 {
-							fmt.Println("Finished all pings for", fqdn)
-							fmt.Println("Winner is", resolved, "at", optimalPing)
-						} else {
-							fmt.Println("All pings failed for", fqdn)
-							fmt.Println("Returning first entry as best-hope")
-						}
-					} else {
-						// Only one entry was given by the authoritative
-						fmt.Println("Found one entry for", fqdn)
-						switch aRecord := dnsRes.Answer[0].(type) {
-						case *dns.A:
-							resolved = aRecord.A.String()
-							ttl = int(aRecord.Hdr.Ttl)
+								// Store ip -> ping map
+								(*pings)[aRecordIp] = ping
+							}(&wg, &pings)
 						}
 					}
-				} else {
-					fmt.Println(host, "not found in remote")
+
+					// Wait for all pings to resolve (max 1+- sec)
+					wg.Wait()
+
+					// Use the optimal ping
+					for ip, ping := range pings {
+						if optimalPing > ping {
+							optimalPing = ping
+							resolved = ip
+						}
+					}
+
+					// log the optimal or use the best-hope if pinging failed/was slow
+					if optimalPing < 1000 {
+						fmt.Println("Finished all pings for", fqdn)
+						fmt.Println("Winner is", resolved, "at", optimalPing)
+					} else {
+						fmt.Println("All pings failed for", fqdn)
+						fmt.Println("Returning first entry as best-hope")
+
+						// Use first A record as the best-hope backup
+						if firstARecord != nil {
+							ttl = int(firstARecord.Hdr.Ttl)
+							resolved = firstARecord.A.String()
+						}
+					}
+					break
 				}
 			}
 
-			// Resolve the request before we try to contact redis (redis is slower than acceptable)
-			fmt.Println(fqdn, "found in", source, "as", resolved)
-			resolveWith <- fmt.Sprintf("%s:%s:%s", source, host, resolved)
-
 			// If we got a non-local resolve, cache it until ttl
 			if resolved != "" {
+				// Resolve the request before we try to contact redis (redis is slower than acceptable)
+				fmt.Println(fqdn, "found in", source, "as", resolved)
+				resolveWith <- fmt.Sprintf("%s:%s:%s", source, host, resolved)
+
 				if pool != nil && source != "local" {
 					// Set the dns answer with the ttl as it's expiration
 					err = pool.Do(radix.FlatCmd(nil, "SETEX", fmt.Sprintf("%s:%s", redisBasis, fqdn), ttl, resolved))
@@ -252,7 +281,7 @@ func main() {
 			} else {
 				fmt.Println("Unable to resolve", fqdn)
 				resolveWith <- fmt.Sprintf("Unable to resolve %s", host)
-				resolved = "\"Unable to resolve\""
+				resolved = "Unable to resolve"
 			}
 
 			// Write to log file if possible
@@ -312,11 +341,4 @@ func main() {
 
 	// Start and hold on normal requests made to :9889
 	http.ListenAndServe(":9888", nil)
-
-	// Make sure we close the file once the program exits
-	if f != nil {
-		if err := f.Close(); err != nil {
-			fmt.Println("Closed logging file")
-		}
-	}
 }
