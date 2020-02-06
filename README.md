@@ -11,7 +11,8 @@ Go may not be in the path in some systems (CSE), make sure you add it:
 
 `module add soft/go`
 
-1) Install modules:
+1 ) Install modules:
+
 `go get`
 
 2a) To compile and run use:
@@ -22,7 +23,7 @@ Go may not be in the path in some systems (CSE), make sure you add it:
 
 `go build main.go`
 
-3) Run pre-compiled:
+3 ) Run pre-compiled:
 
 `./main`
 
@@ -30,6 +31,8 @@ Go may not be in the path in some systems (CSE), make sure you add it:
 
 If you want to also have a local cache, run `./run.sh` in order to start the Redis server.
 This is not required but it will have to query the remote dns for each query to it.
+Sometimes the CSE-Lab machines won't allow you to run the script, I don't
+know what the issue is
 
 If redis-server is already present or you have your own install, run it with:
 
