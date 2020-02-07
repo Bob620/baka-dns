@@ -112,6 +112,7 @@ func main() {
 		host = strings.ToLower(host)
 		fqdn := host
 
+		// Make sure it's actually fully resolved to root
 		if !strings.HasSuffix(host, ".") {
 			fqdn = host + "."
 		}
@@ -131,6 +132,7 @@ func main() {
 			if pool != nil {
 				redisResponse = make(chan string)
 
+				// query redis asynchronously and close the pool on the change redis can't be properly contacted
 				go func(response chan<- string) {
 					redisData := ""
 					err = pool.Do(radix.Cmd(&redisData, "GET", fmt.Sprintf("%s:%s", redisBasis, fqdn)))
