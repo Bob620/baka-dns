@@ -44,48 +44,26 @@ func main() {
 		)
 	}
 
-	// Try to open redis pool
+	// Try to open redis redisPool
 	// If we can't connect to redis we just can't cache, not a bad tradeoff
-	pool, err := radix.NewPool("tcp", "127.0.0.1:64444", 10, radix.PoolConnFunc(quickTimeoutRedis))
+	redisPool, err := radix.NewPool("tcp", "127.0.0.1:64444", 10, radix.PoolConnFunc(quickTimeoutRedis))
 	if err != nil {
 		fmt.Println("Redis is down! Directing all operations to remote")
-		pool = nil
+		redisPool = nil
 	} else {
 		fmt.Println("Redis connected")
 	}
 
-	// Set up upstream dns client
-	dnsClient := new(dns.Client)
+	// Use cloudflare if possible, fall back to CSE-Lab local dns resolver
 	knownServers := []string{"1.1.1.1", "1.0.0.1", "127.0.0.53"}
-	var operationalServers []string
+	dnsPool := createUpstreamPool(10, &knownServers)
 
-	// Check for well-known DNS resolvers to know which ones work on the current host
-	// Common issue for CSE-Lab machines is blocking UDP to 1.1.1.1
-	for i := range knownServers {
-		server := knownServers[i]
+	fmt.Printf("Found %d operatonal authorative dns servers\n", len(*dnsPool.operationalServers))
 
-		// Setup the dns message for well-known "google.com"
-		m := new(dns.Msg)
-		m.SetQuestion(dns.Fqdn("google.com"), dns.TypeA)
-
-		// Make the dns request
-		_, _, err := dnsClient.Exchange(m, net.JoinHostPort(server, "53"))
-		if err == nil {
-			// If we get a response we can assume the server is live
-			operationalServers = append(operationalServers, server)
-		}
-	}
-
-	fmt.Printf("Found %d operatonal authorative dns servers\n", len(operationalServers))
-
-	if len(operationalServers) < 1 {
+	if len(*dnsPool.operationalServers) < 1 {
 		fmt.Println("Unable to find upstream dns, unable to start server")
 		return
 	}
-
-	// Create the dns config for live use
-	dnsConfig := dns.ClientConfig{Servers: operationalServers, Port: "53"}
-	dnsClient.Timeout = 100 * time.Millisecond
 
 	dnsHandler := func(data string) string {
 		// Parse requested string
@@ -129,19 +107,19 @@ func main() {
 			var redisResponse chan string
 
 			// Check for redis and then query the cache
-			if pool != nil {
+			if redisPool != nil {
 				redisResponse = make(chan string)
 
-				// query redis asynchronously and close the pool on the change redis can't be properly contacted
+				// query redis asynchronously and close the redisPool on the change redis can't be properly contacted
 				go func(response chan<- string) {
 					redisData := ""
-					err = pool.Do(radix.Cmd(&redisData, "GET", fmt.Sprintf("%s:%s", redisBasis, fqdn)))
+					err = redisPool.Do(radix.Cmd(&redisData, "GET", fmt.Sprintf("%s:%s", redisBasis, fqdn)))
 					response <- redisData
 
 					if err != nil {
-						pool.Close()
+						_ = redisPool.Close()
 						// Redis is dead, abandon ship!
-						pool = nil
+						redisPool = nil
 					}
 				}(redisResponse)
 			}
@@ -160,15 +138,7 @@ func main() {
 				fmt.Println(host, "not found in local, querying remote...")
 				var dnsRes *dns.Msg
 
-				// Make the dns request to as many working servers as we need until we get a non-err response
-				for i := range dnsConfig.Servers {
-					source = dnsConfig.Servers[i]
-					dnsRes, _, err = dnsClient.Exchange(m, net.JoinHostPort(source, dnsConfig.Port))
-
-					if err == nil {
-						break
-					}
-				}
+				dnsRes, source, _ = dnsPool.Do(*m)
 
 				// Catch when all of the upstream resolvers fail
 				if dnsRes == nil {
@@ -278,9 +248,9 @@ func main() {
 				fmt.Println(fqdn, "found in", source, "as", resolved)
 				resolveWith <- fmt.Sprintf("%s:%s:%s", source, host, resolved)
 
-				if pool != nil && source != "local" {
+				if redisPool != nil && source != "local" {
 					// Set the dns answer with the ttl as it's expiration
-					err = pool.Do(radix.FlatCmd(nil, "SETEX", fmt.Sprintf("%s:%s", redisBasis, fqdn), ttl, resolved))
+					err = redisPool.Do(radix.FlatCmd(nil, "SETEX", fmt.Sprintf("%s:%s", redisBasis, fqdn), ttl, resolved))
 					if err != nil {
 						fmt.Println("Unable to cache")
 					} else {
@@ -297,7 +267,7 @@ func main() {
 			if f != nil {
 				if _, err := f.Write([]byte(fmt.Sprintf("%s,%s\n", host, resolved))); err != nil {
 					fmt.Println("Error while writing log, closing file")
-					f.Close()
+					_ = f.Close()
 				}
 			}
 		}(resolveWith)
@@ -314,7 +284,7 @@ func main() {
 			fmt.Println("error:", err)
 		}
 
-		io.WriteString(writer, dnsHandler(fmt.Sprintf("%s", data)))
+		_, _ = io.WriteString(writer, dnsHandler(fmt.Sprintf("%s", data)))
 	})
 
 	// Spawn goroutine to handle websockets
@@ -333,13 +303,13 @@ func main() {
 					if err != nil {
 						// Kill a dead connection or restart an existing one from an EOF error loop
 						// It should work for the provided python3 client
-						conn.Close()
+						_ = conn.Close()
 						break
 					}
 
 					// If we have a request
 					if length > 0 {
-						conn.Write([]byte(dnsHandler(string(data[:length]))))
+						_, _ = conn.Write([]byte(dnsHandler(string(data[:length]))))
 					}
 				}
 			}()
@@ -349,5 +319,5 @@ func main() {
 	fmt.Println("Listening on :9889 (WS)\nListening on :9888 (POST)")
 
 	// Start and hold on normal requests made to :9889
-	http.ListenAndServe(":9888", nil)
+	_ = http.ListenAndServe(":9888", nil)
 }
