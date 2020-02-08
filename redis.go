@@ -25,7 +25,7 @@ func quickTimeoutRedis(network, addr string) (radix.Conn, error) {
 	)
 }
 
-func makeRedisPool(addr, basis string) (*RedisPool, error) {
+func MakeRedisPool(addr, basis string) (*RedisPool, error) {
 	// Try to open redis redisPool
 	redisPool, err := radix.NewPool("tcp", addr, 10, radix.PoolConnFunc(quickTimeoutRedis))
 
@@ -68,6 +68,6 @@ func (pool RedisPool) Set(key, value string) <-chan RedisResponse {
 	return pool.FlatCmd("SET", fmt.Sprintf("%s:%s", pool.basis, key), []string{value})
 }
 
-func (pool RedisPool) SetEx(key, value string, ttl int) <-chan RedisResponse {
+func (pool RedisPool) SetEx(key, value string, ttl uint32) <-chan RedisResponse {
 	return pool.FlatCmd("SETEX", fmt.Sprintf("%s:%s", pool.basis, key), []string{fmt.Sprintf("%d", ttl), value})
 }

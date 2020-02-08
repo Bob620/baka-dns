@@ -8,7 +8,7 @@ import (
 	"sync"
 )
 
-func asyncPing(wg *sync.WaitGroup, pings *map[string]float64, ip string) {
+func AsyncPing(wg *sync.WaitGroup, pings *map[string]float64, ip string) {
 	defer wg.Done()
 
 	// Ping command requires `root` in order to run, thus we have to `exec ping`

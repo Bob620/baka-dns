@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -16,17 +17,16 @@ type DnsHandler struct {
 	dnsPool   *UpstreamDNSPool
 }
 
-func makeDNSHandler(logFile *os.File, redisPool *RedisPool, dnsPool *UpstreamDNSPool) *DnsHandler {
+func MakeDNSHandler(logFile *os.File, redisPool *RedisPool, dnsPool *UpstreamDNSPool) *DnsHandler {
 	return &DnsHandler{logFile, redisPool, dnsPool}
 }
 
-func (handler DnsHandler) Do(data string) string {
-	// Parse requested string
-	requestedUrl, err := url.Parse(data)
+func sanitizeFQDN(urlString string) (string, error, string) {
+	requestedUrl, err := url.Parse(urlString)
 
 	if err != nil {
 		fmt.Println("Unable to parse requested url")
-		return "Unable to parse requested url"
+		return "", errors.New("unable to parse requested url"), ""
 	}
 
 	// Try to make the hostname the hostname (doesn't always work)
@@ -37,7 +37,7 @@ func (handler DnsHandler) Do(data string) string {
 
 	if host == "" {
 		fmt.Println("Unable to parse requested url")
-		return "Unable to parse requested url"
+		return "", errors.New("unable to parse requested url"), ""
 	}
 
 	// Normalize the hostname and make it a fqdn
@@ -50,6 +50,16 @@ func (handler DnsHandler) Do(data string) string {
 		fqdn = host + "."
 	}
 
+	return fqdn, nil, host
+}
+
+func (handler DnsHandler) Do(urlString string) string {
+	// Parse requested string
+	fqdn, err, host := sanitizeFQDN(urlString)
+	if err != nil {
+		return "unable to parse requested url"
+	}
+
 	fmt.Println("Searching for", fqdn)
 	resolveWith := make(chan string)
 
@@ -57,22 +67,23 @@ func (handler DnsHandler) Do(data string) string {
 	go func(resolveWith chan string) {
 		resolved := ""
 		source := "local" // Default to local source
-		ttl := 300        // Default to common 5min ttl unless overridden later
+		var ttl uint32
 
+		// Start the redis query
 		redisResponse := handler.redisPool.Get(fqdn)
 
 		// Setup the dns message pre-maturely while we wait for redis to resolve
 		m := new(dns.Msg)
 		m.SetQuestion(dns.Fqdn(fqdn), dns.TypeA)
+		var dnsRes *dns.Msg
 
+		// Resolve redis
 		response := <-redisResponse
 		resolved = response.data
 
 		// If we can't resolve via cache look in upstream
 		if resolved == "" {
 			fmt.Println(host, "not found in local, querying remote...")
-			var dnsRes *dns.Msg
-
 			dnsRes, source, _ = handler.dnsPool.Do(*m)
 
 			// Catch when all of the upstream resolvers fail
@@ -93,7 +104,7 @@ func (handler DnsHandler) Do(data string) string {
 				switch aRecord := dnsRes.Answer[0].(type) {
 				case *dns.A:
 					resolved = aRecord.A.String()
-					ttl = int(aRecord.Hdr.Ttl)
+					ttl = aRecord.Hdr.Ttl
 				}
 				break
 			default:
@@ -116,11 +127,9 @@ func (handler DnsHandler) Do(data string) string {
 							firstARecord = a.(*dns.A)
 						}
 
-						aRecordIp := a.(*dns.A).A.String()
-
 						// Start goroutines for each ping command
 						wg.Add(1)
-						go asyncPing(&wg, &pings, aRecordIp)
+						go AsyncPing(&wg, &pings, a.(*dns.A).A.String())
 					}
 				}
 
@@ -145,7 +154,7 @@ func (handler DnsHandler) Do(data string) string {
 
 					// Use first A record as the best-hope backup
 					if firstARecord != nil {
-						ttl = int(firstARecord.Hdr.Ttl)
+						ttl = firstARecord.Hdr.Ttl
 						resolved = firstARecord.A.String()
 					}
 				}

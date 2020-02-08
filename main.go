@@ -29,7 +29,7 @@ func main() {
 		defer f.Close()
 	}
 
-	redisPool, err = makeRedisPool("127.0.0.1:64444", "baka-dns:urls")
+	redisPool, err = MakeRedisPool("127.0.0.1:64444", "baka-dns:urls")
 	if err != nil {
 		fmt.Println("Unable to connect to redis")
 	} else {
@@ -37,7 +37,7 @@ func main() {
 	}
 
 	// Use cloudflare if possible, fall back to CSE-Lab local dns resolver
-	dnsPool = createUpstreamPool(10, &[]string{"1.1.1.1", "1.0.0.1", "127.0.0.53"})
+	dnsPool = MakeUpstreamPool(10, &[]string{"1.1.1.1", "1.0.0.1", "127.0.0.53"})
 
 	fmt.Printf("Found %d operatonal authorative dns servers\n", len(*dnsPool.operationalServers))
 
@@ -47,7 +47,7 @@ func main() {
 	}
 
 	// Create dns handling function
-	dnsHandler := makeDNSHandler(f, redisPool, dnsPool)
+	dnsHandler := MakeDNSHandler(f, redisPool, dnsPool)
 
 	// Handle POST requests to the server
 	http.HandleFunc("/", func(writer http.ResponseWriter, request *http.Request) {

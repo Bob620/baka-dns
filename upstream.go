@@ -52,7 +52,7 @@ func DNSWorker(pool *UpstreamDNSPool) {
 	}
 }
 
-func createUpstreamPool(size int, knownServers *[]string) *UpstreamDNSPool {
+func MakeUpstreamPool(size int, knownServers *[]string) *UpstreamDNSPool {
 	// Check for well-known DNS resolvers to know which ones work on the current host
 	// Common issue for CSE-Lab machines is blocking UDP to 1.1.1.1
 	serverCheckChan := make(chan string)
