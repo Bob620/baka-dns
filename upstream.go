@@ -30,7 +30,7 @@ type UpstreamDNSPool struct {
 func DNSWorker(pool *UpstreamDNSPool) {
 	defer pool.wg.Done()
 	dnsClient := new(dns.Client)
-	dnsClient.Timeout = 100 * time.Millisecond
+	dnsClient.Timeout = 300 * time.Millisecond
 
 	for {
 		query := <-pool.messagesToResolve
@@ -61,7 +61,7 @@ func MakeUpstreamPool(size int, knownServers *[]string) *UpstreamDNSPool {
 	for _, server := range *knownServers {
 		go func(server string, returnChan chan<- string) {
 			dnsClient := new(dns.Client)
-			dnsClient.Timeout = 100 * time.Millisecond
+			dnsClient.Timeout = 500 * time.Millisecond
 
 			// Setup the dns message for well-known "google.com"
 			m := new(dns.Msg)
