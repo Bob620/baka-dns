@@ -19,6 +19,7 @@ import (
 func main() {
 	var dnsPool *UpstreamDNSPool
 	var redisPool *RedisPool
+	var localCache *Cache
 
 	// Try to open the log file
 	f, err := os.OpenFile("dns-server-log.csv", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
@@ -46,8 +47,10 @@ func main() {
 		return
 	}
 
+	localCache = MakeCache(100)
+
 	// Create dns handling function
-	dnsHandler := MakeDNSHandler(f, redisPool, dnsPool)
+	dnsHandler := MakeDNSHandler(f, redisPool, dnsPool, localCache)
 
 	// Handle POST requests to the server
 	http.HandleFunc("/", func(writer http.ResponseWriter, request *http.Request) {
