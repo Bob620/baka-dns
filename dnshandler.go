@@ -68,7 +68,10 @@ func (handler DnsHandler) Do(urlString string) string {
 	// Spawn a goroutine to handle async tasks
 	go func(resolveWith chan string) {
 		// Start the redis query
-		redisResponse := handler.redisPool.Get(fqdn)
+		var redisResponse <-chan RedisResponse
+		if handler.redisPool != nil {
+			redisResponse = handler.redisPool.Get(fqdn)
+		}
 
 		resolved := handler.localCache.Get(fqdn)
 		source := "local" // Default to local source
@@ -84,7 +87,10 @@ func (handler DnsHandler) Do(urlString string) string {
 			ttl = 300 // Set redis grabs to 5 min ttl in local cache
 
 			// Resolve redis
-			response := <-redisResponse
+			var response RedisResponse
+			if redisResponse != nil {
+				response = <-redisResponse
+			}
 			resolved = response.data
 
 			// If we can't resolve via cache look in upstream
