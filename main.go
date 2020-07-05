@@ -10,27 +10,18 @@ package main
 
 import (
 	"fmt"
-	"io"
-	"net"
-	"net/http"
-	"os"
+	"github.com/Bob620/baka-dns/cache"
+	"github.com/miekg/dns"
 )
+
+const port = ":53"
 
 func main() {
 	var dnsPool *UpstreamDNSPool
 	var redisPool *RedisPool
-	var localCache *Cache
+	var localCache *cache.Cache
 
-	// Try to open the log file
-	f, err := os.OpenFile("dns-server-log.csv", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		fmt.Println("Unable to open log file for appending\nResolve this issue then restart if logging desired")
-	} else {
-		fmt.Println("Log file opened")
-		defer f.Close()
-	}
-
-	redisPool, err = MakeRedisPool("127.0.0.1:64444", "baka-dns:urls")
+	redisPool, err := MakeRedisPool("127.0.0.1:64444", "baka-dns:urls")
 	if err != nil {
 		fmt.Println("Unable to connect to redis")
 	} else {
@@ -38,7 +29,7 @@ func main() {
 	}
 
 	// Use cloudflare if possible, fall back to CSE-Lab local dns resolver
-	dnsPool = MakeUpstreamPool(10, &[]string{"1.1.1.1", "1.0.0.1", "127.0.0.53"})
+	dnsPool = MakeUpstreamPool(10, &[]UpstreamServer{{"192.168.2.1", "5353"}}) //, {"1.1.1.1", "53"}, {"1.0.0.1", "53"}, {"127.0.0.1", "53"}})
 
 	fmt.Printf("Found %d operatonal authorative dns servers\n", len(*dnsPool.operationalServers))
 
@@ -47,53 +38,37 @@ func main() {
 		return
 	}
 
-	localCache = MakeCache(100)
+	localCache = cache.MakeCache(100)
 
 	// Create dns handling function
-	dnsHandler := MakeDNSHandler(f, redisPool, dnsPool, localCache)
+	dnsHandler := MakeDNSHandler(redisPool, dnsPool, localCache)
 
-	// Handle POST requests to the server
-	http.HandleFunc("/", func(writer http.ResponseWriter, request *http.Request) {
-		// Read in and process the request body
-		data := make([]byte, request.ContentLength)
-		if _, err := io.ReadFull(request.Body, data); err != nil {
-			fmt.Println("error:", err)
+	server := dns.Server{
+		Addr: port,
+		Net:  "udp",
+	}
+
+	server.Handler = dns.HandlerFunc(func(writer dns.ResponseWriter, msg *dns.Msg) {
+		defer writer.Close()
+
+		res, err := dnsHandler.Do(&msg.Question[0])
+
+		msg.RecursionAvailable = true
+
+		if err == nil {
+			msg.Answer = res
+			msg.Response = true
+			_ = writer.WriteMsg(msg)
+		} else {
+			msg.Response = false
+			_ = writer.WriteMsg(msg)
 		}
-
-		_, _ = io.WriteString(writer, dnsHandler.Do(fmt.Sprintf("%s", data)))
 	})
 
-	// Spawn goroutine to handle websockets
-	go func() {
-		ln, _ := net.Listen("tcp", ":9889")
+	fmt.Println("Listening on", port)
+	err = server.ListenAndServe()
 
-		for {
-			conn, _ := ln.Accept()
-
-			// Spawn goroutine for each connection made to the websocket
-			go func() {
-				for {
-					data := make([]byte, 1024)
-
-					length, err := conn.Read(data)
-					if err != nil {
-						// Kill a dead connection or restart an existing one from an EOF error loop
-						// It should work for the provided python3 client
-						_ = conn.Close()
-						break
-					}
-
-					// If we have a request
-					if length > 0 {
-						_, _ = conn.Write([]byte(dnsHandler.Do(string(data[:length]))))
-					}
-				}
-			}()
-		}
-	}()
-
-	fmt.Println("Listening on :9889 (WS)\nListening on :9888 (POST)")
-
-	// Start and hold on normal requests made to :9889
-	_ = http.ListenAndServe(":9888", nil)
+	if err != nil {
+		fmt.Println(err)
+	}
 }

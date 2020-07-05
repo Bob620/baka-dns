@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/mediocregopher/radix"
+	"github.com/mediocregopher/radix/v3"
 )
 
 type RedisResponse struct {
