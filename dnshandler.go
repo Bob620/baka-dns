@@ -3,16 +3,17 @@ package main
 import (
 	"fmt"
 	"github.com/Bob620/baka-dns/cache"
+	"github.com/Bob620/baka-dns/upstream"
 	"github.com/miekg/dns"
 )
 
 type DnsHandler struct {
 	redisPool  *RedisPool
-	dnsPool    *UpstreamDNSPool
+	dnsPool    *upstream.Pool
 	localCache *cache.Cache
 }
 
-func MakeDNSHandler(redisPool *RedisPool, dnsPool *UpstreamDNSPool, localCache *cache.Cache) *DnsHandler {
+func MakeDNSHandler(redisPool *RedisPool, dnsPool *upstream.Pool, localCache *cache.Cache) *DnsHandler {
 	return &DnsHandler{redisPool, dnsPool, localCache}
 }
 
@@ -22,10 +23,7 @@ func (handler DnsHandler) Do(question *dns.Question) ([]dns.RR, error) {
 	result := handler.localCache.Get(dns.Name(question.Name), dns.Type(question.Qtype))
 
 	if result != nil {
-		go func(name string, total int) {
-			fmt.Println(name, "found in local cache with", total, "answers")
-		}(question.Name, len(result))
-
+		fmt.Println(question.Name, "found in local cache with", len(result), "answers")
 		return result, nil
 	}
 

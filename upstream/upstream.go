@@ -1,38 +1,32 @@
-package main
+package upstream
 
 import (
 	"fmt"
+	"github.com/miekg/dns"
 	"net"
 	"sync"
 	"time"
-
-	"github.com/miekg/dns"
 )
 
 type MessageResult struct {
 	message *dns.Msg
 	error   error
-	server  *UpstreamServer
+	server  *Server
 }
 
-type DNSQuery struct {
+type Query struct {
 	message     dns.Msg
 	resolveChan chan<- MessageResult
 }
 
-type UpstreamServer struct {
-	Address string
-	Port    string
+type Server struct {
+	Name     string
+	Address  string
+	Port     string
+	Priority uint
 }
 
-type UpstreamDNSPool struct {
-	knownServers       *[]UpstreamServer
-	operationalServers *[]UpstreamServer
-	messagesToResolve  chan DNSQuery
-	wg                 *sync.WaitGroup
-}
-
-func DNSWorker(pool *UpstreamDNSPool) {
+func DNSWorker(pool *Pool) {
 	defer pool.wg.Done()
 	dnsClient := new(dns.Client)
 	dnsClient.Timeout = 300 * time.Millisecond
@@ -57,14 +51,14 @@ func DNSWorker(pool *UpstreamDNSPool) {
 	}
 }
 
-func MakeUpstreamPool(size int, knownServers *[]UpstreamServer) *UpstreamDNSPool {
+func MakeUpstreamPool(size int, knownServers *[]Server) *Pool {
 	// Check for well-known DNS resolvers to know which ones work on the current host
 	// Common issue for CSE-Lab machines is blocking UDP to 1.1.1.1
-	serverCheckChan := make(chan UpstreamServer)
+	serverCheckChan := make(chan Server)
 
 	// Spawn goroutines for all the known resolvers
 	for _, server := range *knownServers {
-		go func(server UpstreamServer, returnChan chan<- UpstreamServer) {
+		go func(server Server, returnChan chan<- Server) {
 			dnsClient := new(dns.Client)
 			dnsClient.Timeout = 500 * time.Millisecond
 
@@ -72,7 +66,7 @@ func MakeUpstreamPool(size int, knownServers *[]UpstreamServer) *UpstreamDNSPool
 			m := new(dns.Msg)
 			m.SetQuestion(dns.Fqdn("google.com"), dns.TypeA)
 
-			fmt.Printf("Checking %s:%s...\n", server.Address, server.Port)
+			fmt.Printf("Checking [%s]:%s...\n", server.Address, server.Port)
 
 			// Make the dns request
 			_, _, err := dnsClient.Exchange(m, net.JoinHostPort(server.Address, server.Port))
@@ -81,25 +75,25 @@ func MakeUpstreamPool(size int, knownServers *[]UpstreamServer) *UpstreamDNSPool
 				returnChan <- server
 			} else {
 				// Server does not work, resolve as nil
-				returnChan <- UpstreamServer{}
+				returnChan <- Server{}
 			}
 
 		}(server, serverCheckChan)
 	}
 
-	operationalServers := []UpstreamServer{}
+	operationalServers := make([]Server, len(*knownServers))[:0]
 
 	// Wait for all the well known checks and resolve them
 	for range *knownServers {
 		server := <-serverCheckChan
 		if server.Address != "" {
-			fmt.Printf("Resolved %s:%s\n", server.Address, server.Port)
+			fmt.Printf("Resolved [%s]:%s\n", server.Address, server.Port)
 			operationalServers = append(operationalServers, server)
 		}
 	}
 
 	var wg sync.WaitGroup
-	pool := UpstreamDNSPool{knownServers, &operationalServers, make(chan DNSQuery), &wg}
+	pool := Pool{knownServers, &operationalServers, make(chan Query), &wg}
 
 	// Set up upstream dns clients
 	wg.Add(size)
@@ -108,11 +102,4 @@ func MakeUpstreamPool(size int, knownServers *[]UpstreamServer) *UpstreamDNSPool
 	}
 
 	return &pool
-}
-
-func (pool UpstreamDNSPool) Do(m dns.Msg) (*dns.Msg, *UpstreamServer, error) {
-	resolver := make(chan MessageResult)
-	pool.messagesToResolve <- DNSQuery{m, resolver}
-	result := <-resolver
-	return result.message, result.server, result.error
 }

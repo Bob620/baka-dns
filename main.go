@@ -11,13 +11,14 @@ package main
 import (
 	"fmt"
 	"github.com/Bob620/baka-dns/cache"
+	"github.com/Bob620/baka-dns/upstream"
 	"github.com/miekg/dns"
 )
 
-const port = ":53"
+const port = ":5333"
 
 func main() {
-	var dnsPool *UpstreamDNSPool
+	var dnsPool *upstream.Pool
 	var redisPool *RedisPool
 	var localCache *cache.Cache
 
@@ -28,12 +29,15 @@ func main() {
 		fmt.Println("Connected to redis")
 	}
 
-	// Use cloudflare if possible, fall back to CSE-Lab local dns resolver
-	dnsPool = MakeUpstreamPool(10, &[]UpstreamServer{{"192.168.2.1", "5353"}}) //, {"1.1.1.1", "53"}, {"1.0.0.1", "53"}, {"127.0.0.1", "53"}})
+	dnsPool = upstream.MakeUpstreamPool(10, &[]upstream.Server{
+		{"cloudflared", "192.168.2.1", "5353", 0},
+		{"1.1.1.1", "1.1.1.1", "53", 1},
+		{"1.0.0.1", "1.0.0.1", "53", 2},
+	})
 
-	fmt.Printf("Found %d operatonal authorative dns servers\n", len(*dnsPool.operationalServers))
+	fmt.Printf("Found %d operatonal authorative dns servers\n", dnsPool.NumUpstreams())
 
-	if len(*dnsPool.operationalServers) < 1 {
+	if dnsPool.NumUpstreams() < 1 {
 		fmt.Println("Unable to find upstream dns, unable to start server")
 		return
 	}
