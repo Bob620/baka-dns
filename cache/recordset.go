@@ -2,6 +2,7 @@ package cache
 
 import (
 	"github.com/miekg/dns"
+	"sync"
 	"time"
 )
 
@@ -11,8 +12,16 @@ type Record struct {
 }
 
 type RecordSet struct {
-	Records []*Record
 	Expires time.Time
+	records []*Record
+	mutex   sync.RWMutex
+}
+
+func createRecordSet() *RecordSet {
+	return &RecordSet{
+		Expires: time.Now(),
+		records: make([]*Record, 1)[:0],
+	}
 }
 
 func (records *RecordSet) clean() {
@@ -20,19 +29,39 @@ func (records *RecordSet) clean() {
 
 	// Filter the Record set
 	newPos := 0
-	for _, record := range records.Records {
+	records.mutex.Lock()
+	for _, record := range records.records {
 		if record.Expires.After(now) {
-			records.Records[newPos] = record
+			records.records[newPos] = record
 			newPos++
 		}
 	}
-	records.Records = records.Records[:newPos]
+	records.records = records.records[:newPos]
+	records.mutex.Unlock()
 }
 
 func (records *RecordSet) Add(record *Record) {
-	records.Records = append(records.Records, record)
+	records.mutex.Lock()
+	records.records = append(records.records, record)
 
 	if records.Expires.Before(record.Expires) {
 		records.Expires = record.Expires
 	}
+	records.mutex.Unlock()
+}
+
+func (records *RecordSet) GetRecords() []dns.RR {
+	records.mutex.RLock()
+	rrs := make([]dns.RR, len(records.records))
+	for i, record := range records.records {
+		record.RR.Header().Ttl = uint32(record.Expires.Sub(time.Now()) / time.Second)
+		rrs[i] = record.RR
+	}
+	records.mutex.RUnlock()
+
+	return rrs
+}
+
+func (records *RecordSet) Len() int {
+	return len(records.records)
 }

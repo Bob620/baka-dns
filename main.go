@@ -12,13 +12,14 @@ import (
 	"fmt"
 	"github.com/Bob620/baka-dns/cache"
 	"github.com/Bob620/baka-dns/upstream"
+	"github.com/Bob620/baka-dns/upstream/pool"
 	"github.com/miekg/dns"
 )
 
-const port = ":5333"
+const port = ":53"
 
 func main() {
-	var dnsPool *upstream.Pool
+	var dnsPool *pool.Pool
 	var redisPool *RedisPool
 	var localCache *cache.Cache
 
@@ -29,7 +30,7 @@ func main() {
 		fmt.Println("Connected to redis")
 	}
 
-	dnsPool = upstream.MakeUpstreamPool(10, &[]upstream.Server{
+	dnsPool = upstream.MakeUpstreamPool(10, &[]pool.Server{
 		{"cloudflared", "192.168.2.1", "5353", 0},
 		{"1.1.1.1", "1.1.1.1", "53", 1},
 		{"1.0.0.1", "1.0.0.1", "53", 2},
@@ -55,18 +56,33 @@ func main() {
 	server.Handler = dns.HandlerFunc(func(writer dns.ResponseWriter, msg *dns.Msg) {
 		defer writer.Close()
 
-		res, err := dnsHandler.Do(&msg.Question[0])
+		if msg.Opcode != dns.OpcodeQuery {
+			msg.Rcode = dns.RcodeNotImplemented
+			_ = writer.WriteMsg(msg)
 
+			return
+		}
+
+		res, err := dnsHandler.Do(&msg.Question[0])
 		msg.RecursionAvailable = true
 
+		if res != nil {
+			msg.Authoritative = res.Authoritative
+			msg.AuthenticatedData = res.AuthenticatedData
+			msg.Ns = res.Ns
+			msg.Extra = res.Extra
+			msg.Rcode = dns.RcodeSuccess
+		}
+
 		if err == nil {
-			msg.Answer = res
 			msg.Response = true
-			_ = writer.WriteMsg(msg)
+			msg.Answer = res.Answer
 		} else {
 			msg.Response = false
-			_ = writer.WriteMsg(msg)
+			msg.Rcode = dns.RcodeNameError
 		}
+
+		_ = writer.WriteMsg(msg)
 	})
 
 	fmt.Println("Listening on", port)

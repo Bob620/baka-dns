@@ -33,6 +33,11 @@ func (cache *Cache) clean() {
 			continue
 		}
 
+		if cache.domains[domainName] == nil {
+			delete(cache.domains, domainName)
+			continue
+		}
+
 		if !cache.domains[domainName].Expires.After(now) {
 			delete(cache.domains, domainName)
 		} else {
@@ -52,57 +57,85 @@ func (cache *Cache) deleteFirst() {
 	cache.mutex.Unlock()
 }
 
-func (cache *Cache) Get(domainName dns.Name, recordType dns.Type) []dns.RR {
+func (cache *Cache) getDomain(domainName dns.Name) *Domain {
 	now := time.Now()
 
 	cache.mutex.RLock()
 	domain := cache.domains[domainName]
 	cache.mutex.RUnlock()
 
-	if domain == nil {
-		return nil
-	}
-
-	if domain.Expires.Before(now) {
+	if domain != nil && domain.Expires.Before(now) {
 		cache.clean()
 		return nil
 	}
 
-	records := domain.Records[recordType]
-	if records == nil {
-		return nil
+	return domain
+}
+
+func (cache *Cache) setDomain(domainName dns.Name, domain *Domain) {
+	cache.mutex.Lock()
+	cache.expireOrder = append(cache.expireOrder, domainName)
+	cache.domains[domainName] = domain
+	cache.mutex.Unlock()
+}
+
+func (cache *Cache) Get(domainName dns.Name, recordType dns.Type) ([]dns.RR, bool) {
+	var cnames *RecordSet
+	now := time.Now()
+	cnameType := dns.Type(dns.TypeCNAME)
+	output := make([]dns.RR, 2)[:0]
+
+	domain := cache.getDomain(domainName)
+
+	if domain == nil {
+		return nil, false
 	}
 
-	if records.Expires.Before(now) {
-		domain.delete(recordType)
-		return nil
+	if recordType != cnameType {
+		cnames = domain.Get(cnameType)
+	}
+	records := domain.Get(recordType)
+
+	if cnames != nil {
+		if cnames.Expires.Before(now) || cnames.Len() == 0 {
+			domain.delete(cnameType)
+			cnames = nil
+		} else {
+			cnames.clean()
+			output = append(output, cnames.GetRecords()...)
+		}
 	}
 
-	records.clean()
-	rrs := make([]dns.RR, len(records.Records))
-	for i, record := range records.Records {
-		record.RR.Header().Ttl = uint32(record.Expires.Sub(time.Now()) / time.Second)
-		rrs[i] = record.RR
+	if records != nil {
+		if records.Expires.Before(now) || records.Len() == 0 {
+			domain.delete(recordType)
+			records = nil
+		} else {
+			records.clean()
+			output = append(output, records.GetRecords()...)
+		}
 	}
 
-	return rrs
+	if records == nil && cnames == nil {
+		return nil, false
+	}
 
+	return output, records == nil
 }
 
 func (cache *Cache) Set(domainName dns.Name, records []dns.RR) {
 	now := time.Now()
 
-	cache.mutex.Lock()
-	domain := cache.domains[domainName]
+	domain := cache.getDomain(domainName)
 	if domain == nil {
+		cache.clean()
 		if len(cache.expireOrder) >= cache.size {
 			cache.deleteFirst()
 		}
 
-		domain = &Domain{map[dns.Type]*RecordSet{}, time.Now()}
+		domain = createDomain()
 	}
 
-	recordSet := domain.Records
 	cleanTypes := make(map[dns.Type]bool)
 
 	for _, record := range records {
@@ -110,13 +143,10 @@ func (cache *Cache) Set(domainName dns.Name, records []dns.RR) {
 		recordType := dns.Type(header.Rrtype)
 		ttl := now.Add(time.Second * time.Duration(header.Ttl))
 
-		set := recordSet[recordType]
+		set := domain.Get(recordType)
 		if set == nil || cleanTypes[recordType] == false {
 			cleanTypes[recordType] = true
-			set = &RecordSet{
-				Records: make([]*Record, 1)[:0],
-				Expires: time.Now(),
-			}
+			set = createRecordSet()
 		}
 
 		set.Add(&Record{
@@ -128,10 +158,8 @@ func (cache *Cache) Set(domainName dns.Name, records []dns.RR) {
 			domain.Expires = set.Expires
 		}
 
-		recordSet[recordType] = set
+		domain.Set(recordType, set)
 	}
 
-	cache.expireOrder = append(cache.expireOrder, domainName)
-	cache.domains[domainName] = domain
-	cache.mutex.Unlock()
+	cache.setDomain(domainName, domain)
 }

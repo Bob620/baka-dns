@@ -1,52 +1,86 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"github.com/Bob620/baka-dns/cache"
-	"github.com/Bob620/baka-dns/upstream"
+	"github.com/Bob620/baka-dns/upstream/pool"
 	"github.com/miekg/dns"
 )
 
 type DnsHandler struct {
 	redisPool  *RedisPool
-	dnsPool    *upstream.Pool
+	dnsPool    *pool.Pool
 	localCache *cache.Cache
 }
 
-func MakeDNSHandler(redisPool *RedisPool, dnsPool *upstream.Pool, localCache *cache.Cache) *DnsHandler {
+func MakeDNSHandler(redisPool *RedisPool, dnsPool *pool.Pool, localCache *cache.Cache) *DnsHandler {
 	return &DnsHandler{redisPool, dnsPool, localCache}
 }
 
-func (handler DnsHandler) Do(question *dns.Question) ([]dns.RR, error) {
-	fmt.Println("Searching for", question.Name, "with record type", dns.TypeToString[question.Qtype])
+func (handler DnsHandler) cache(name string, typ uint16) {
+	result, onlyCname := handler.localCache.Get(dns.Name(name), dns.Type(typ))
+	if result == nil || onlyCname {
+		dnsRes, source, _ := handler.dnsPool.Do(pool.Message{Name: name, Type: typ})
 
-	result := handler.localCache.Get(dns.Name(question.Name), dns.Type(question.Qtype))
+		if dnsRes != nil {
+			go fmt.Printf("%s (T:%s) found in [%s]:%s (P:%d) with %d answers\n", name, dns.TypeToString[typ], source.Address, source.Port, source.Priority, len(dnsRes.Answer))
 
-	if result != nil {
-		fmt.Println(question.Name, "found in local cache with", len(result), "answers")
-		return result, nil
+			if dnsRes.Rcode == dns.RcodeSuccess {
+				go func() {
+					if len(dnsRes.Answer) > 0 {
+						handler.localCache.Set(dns.Name(name), dnsRes.Answer)
+					}
+				}()
+			}
+		}
 	}
+}
 
-	msg := new(dns.Msg)
-	msg.SetQuestion(question.Name, question.Qtype)
+func (handler DnsHandler) Do(question *dns.Question) (*dns.Msg, error) {
+	go fmt.Printf("Searching for %s with record type %s\n", question.Name, dns.TypeToString[question.Qtype])
+
+	result, onlyCname := handler.localCache.Get(dns.Name(question.Name), dns.Type(question.Qtype))
+
+	if result != nil && !onlyCname {
+		go fmt.Printf("%s found in local cache with %d answers\n", question.Name, len(result))
+		return &dns.Msg{Answer: result}, nil
+	}
 
 	var dnsRes *dns.Msg
-	dnsRes, source, _ := handler.dnsPool.Do(*msg)
+	dnsRes, source, _ := handler.dnsPool.Do(pool.Message{Name: question.Name, Type: question.Qtype})
+
+	go func(name string, qType uint16) {
+		if qType != dns.TypeCNAME {
+			go handler.cache(name, dns.TypeCNAME)
+		}
+		if qType != dns.TypeNS {
+			go handler.cache(name, dns.TypeNS)
+		}
+		if qType != dns.TypeA {
+			go handler.cache(name, dns.TypeA)
+		}
+		if qType != dns.TypeAAAA {
+			go handler.cache(name, dns.TypeAAAA)
+		}
+	}(question.Name, question.Qtype)
 
 	// Catch when all of the upstream resolvers fail
-	if dnsRes == nil {
-		dnsRes = &dns.Msg{}
+	if dnsRes != nil {
+		go fmt.Printf("%s (T:%s) found in [%s]:%s (P:%d) with %d answers\n", question.Name, dns.TypeToString[question.Qtype], source.Address, source.Port, source.Priority, len(dnsRes.Answer))
+
+		if dnsRes.Rcode == dns.RcodeSuccess {
+			go func() {
+				if len(dnsRes.Answer) > 0 {
+					handler.localCache.Set(dns.Name(question.Name), dnsRes.Answer)
+				}
+			}()
+
+			return dnsRes, nil
+		}
 	}
 
-	fmt.Println(question.Name, "found in", source.Address, ":", source.Port, "with", len(dnsRes.Answer), "answers")
-
-	go func() {
-		if len(dnsRes.Answer) > 0 {
-			handler.localCache.Set(dns.Name(question.Name), dnsRes.Answer)
-		}
-	}()
-
-	return dnsRes.Answer, nil
+	return nil, errors.New("nxdomain")
 
 	/*
 		// Spawn a goroutine to handle async tasks
