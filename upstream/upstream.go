@@ -2,63 +2,22 @@ package upstream
 
 import (
 	"fmt"
+	"github.com/Bob620/baka-dns/upstream/pool"
 	"github.com/miekg/dns"
 	"net"
+	"sort"
 	"sync"
 	"time"
 )
 
-type MessageResult struct {
-	message *dns.Msg
-	error   error
-	server  *Server
-}
-
-type Query struct {
-	message     dns.Msg
-	resolveChan chan<- MessageResult
-}
-
-type Server struct {
-	Name     string
-	Address  string
-	Port     string
-	Priority uint
-}
-
-func DNSWorker(pool *Pool) {
-	defer pool.wg.Done()
-	dnsClient := new(dns.Client)
-	dnsClient.Timeout = 300 * time.Millisecond
-
-	for {
-		query := <-pool.messagesToResolve
-		var err error
-		var dnsRes *dns.Msg
-
-		for _, server := range *pool.operationalServers {
-			dnsRes, _, err = dnsClient.Exchange(&query.message, net.JoinHostPort(server.Address, server.Port))
-			if err == nil {
-				// If we get a response we can return
-				query.resolveChan <- MessageResult{dnsRes, nil, &server}
-				break
-			}
-		}
-
-		if err != nil {
-			query.resolveChan <- MessageResult{nil, err, nil}
-		}
-	}
-}
-
-func MakeUpstreamPool(size int, knownServers *[]Server) *Pool {
+func MakeUpstreamPool(size int, knownServers *[]pool.Server) *pool.Pool {
 	// Check for well-known DNS resolvers to know which ones work on the current host
 	// Common issue for CSE-Lab machines is blocking UDP to 1.1.1.1
-	serverCheckChan := make(chan Server)
+	serverCheckChan := make(chan pool.Server)
 
 	// Spawn goroutines for all the known resolvers
 	for _, server := range *knownServers {
-		go func(server Server, returnChan chan<- Server) {
+		go func(server pool.Server, returnChan chan<- pool.Server) {
 			dnsClient := new(dns.Client)
 			dnsClient.Timeout = 500 * time.Millisecond
 
@@ -75,31 +34,33 @@ func MakeUpstreamPool(size int, knownServers *[]Server) *Pool {
 				returnChan <- server
 			} else {
 				// Server does not work, resolve as nil
-				returnChan <- Server{}
+				returnChan <- pool.Server{}
 			}
 
 		}(server, serverCheckChan)
 	}
 
-	operationalServers := make([]Server, len(*knownServers))[:0]
+	serverOrder := make([]pool.Server, len(*knownServers))[:0]
 
 	// Wait for all the well known checks and resolve them
 	for range *knownServers {
 		server := <-serverCheckChan
 		if server.Address != "" {
-			fmt.Printf("Resolved [%s]:%s\n", server.Address, server.Port)
-			operationalServers = append(operationalServers, server)
+			fmt.Printf("Resolved [%s]:%s with priority %d\n", server.Address, server.Port, server.Priority)
+			serverOrder = append(serverOrder, server)
 		}
 	}
 
+	sort.Sort(pool.ByPriority(serverOrder))
+
 	var wg sync.WaitGroup
-	pool := Pool{knownServers, &operationalServers, make(chan Query), &wg}
+	dnsPool := pool.MakePool(knownServers, &serverOrder, &wg, 500*time.Millisecond)
 
 	// Set up upstream dns clients
 	wg.Add(size)
 	for i := 0; i < size; i++ {
-		go DNSWorker(&pool)
+		go pool.Worker(dnsPool)
 	}
 
-	return &pool
+	return dnsPool
 }
