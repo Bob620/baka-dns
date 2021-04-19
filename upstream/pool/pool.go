@@ -47,7 +47,7 @@ func MakePool(knownServers *[]Server, serverOrder *[]Server, wg *sync.WaitGroup,
 		*serverOrder,
 		&DomainListing{
 			map[string]*Domain{},
-			sync.RWMutex{},
+			&sync.RWMutex{},
 		},
 		make(chan Query),
 		wg,

@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"github.com/Bob620/baka-dns/statistics"
 	"github.com/miekg/dns"
 	"sync"
 	"time"
@@ -10,7 +11,8 @@ type Cache struct {
 	expireOrder []dns.Name
 	domains     map[dns.Name]*Domain
 	size        int
-	mutex       sync.RWMutex
+	mutex       *sync.RWMutex
+	statistics  *statistics.Cache
 }
 
 func MakeCache(size int) *Cache {
@@ -18,6 +20,8 @@ func MakeCache(size int) *Cache {
 		expireOrder: make([]dns.Name, size)[:0],
 		domains:     make(map[dns.Name]*Domain, size),
 		size:        size,
+		mutex:       &sync.RWMutex{},
+		statistics:  statistics.MakeCache(int64(size)),
 	}
 }
 
@@ -46,6 +50,7 @@ func (cache *Cache) clean() {
 		}
 	}
 	cache.expireOrder = cache.expireOrder[:newPos]
+	cache.statistics.SetSize(int64(len(cache.expireOrder)))
 	cache.mutex.Unlock()
 }
 
@@ -53,7 +58,13 @@ func (cache *Cache) deleteFirst() {
 	var domainName dns.Name
 	cache.mutex.Lock()
 	domainName, cache.expireOrder = cache.expireOrder[0], cache.expireOrder[1:]
+	domain := cache.domains[domainName]
+	if domain != nil {
+		cache.statistics.Evict()
+	}
+
 	delete(cache.domains, domainName)
+	cache.statistics.SetSize(int64(len(cache.expireOrder)))
 	cache.mutex.Unlock()
 }
 
@@ -76,6 +87,7 @@ func (cache *Cache) setDomain(domainName dns.Name, domain *Domain) {
 	cache.mutex.Lock()
 	cache.expireOrder = append(cache.expireOrder, domainName)
 	cache.domains[domainName] = domain
+	cache.statistics.SetSize(int64(len(cache.expireOrder)))
 	cache.mutex.Unlock()
 }
 
@@ -117,20 +129,24 @@ func (cache *Cache) Get(domainName dns.Name, recordType dns.Type) ([]dns.RR, boo
 	}
 
 	if records == nil && cnames == nil {
+		cache.statistics.Miss()
 		return nil, false
 	}
 
+	cache.statistics.Hit()
 	return output, records == nil
 }
 
-func (cache *Cache) Set(domainName dns.Name, records []dns.RR) {
+func (cache *Cache) Set(domainName dns.Name, records []dns.RR, tangent bool) {
 	now := time.Now()
 
 	domain := cache.getDomain(domainName)
 	if domain == nil {
 		cache.clean()
-		if len(cache.expireOrder) >= cache.size {
-			cache.deleteFirst()
+		if len(cache.expireOrder)+len(records) >= cache.size {
+			for range records {
+				cache.deleteFirst()
+			}
 		}
 
 		domain = createDomain()
@@ -159,6 +175,13 @@ func (cache *Cache) Set(domainName dns.Name, records []dns.RR) {
 		}
 
 		domain.Set(recordType, set)
+		cache.statistics.Insert()
+	}
+
+	if tangent {
+		cache.statistics.TangentRequest()
+	} else {
+		cache.statistics.Request()
 	}
 
 	cache.setDomain(domainName, domain)

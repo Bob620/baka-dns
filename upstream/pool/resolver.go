@@ -8,7 +8,7 @@ type Resolver struct {
 	resolver chan<- *MessageResult
 	resolves []chan<- *MessageResult
 	result   *MessageResult
-	mutex    sync.Mutex
+	mutex    *sync.Mutex
 }
 
 func (poolResolver *Resolver) Add(resolver chan<- *MessageResult) {

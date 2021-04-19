@@ -6,11 +6,15 @@ import (
 
 type Domain struct {
 	resolvers map[uint16]*Resolver
-	mutex     sync.Mutex
+	mutex     *sync.RWMutex
 }
 
 func (domain *Domain) Get(typeId uint16) *Resolver {
-	return domain.resolvers[typeId]
+	domain.mutex.RLock()
+	res := domain.resolvers[typeId]
+	domain.mutex.RUnlock()
+
+	return res
 }
 
 func (domain *Domain) Add(typeId uint16, resolver chan<- *MessageResult) (resolve *Resolver) {
@@ -20,7 +24,7 @@ func (domain *Domain) Add(typeId uint16, resolver chan<- *MessageResult) (resolv
 	resolve = &Resolver{
 		resolver: subResolver,
 		resolves: make([]chan<- *MessageResult, 2)[:0],
-		mutex:    sync.Mutex{},
+		mutex:    &sync.Mutex{},
 	}
 	resolve.Add(resolver)
 	domain.resolvers[typeId] = resolve
